@@ -3,15 +3,16 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import gymnasium as gym
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from torch.utils.tensorboard import SummaryWriter
 
 from buffers import ReplayBuffer
 
@@ -50,6 +51,52 @@ class Args:
     """timestep to start learning"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
+    plot_dir: str = "learning_plot"
+    """directory where learning plots are saved"""
+
+
+def _moving_average(values, window_size):
+    if len(values) < window_size:
+        return np.array(values, dtype=np.float32)
+    return np.convolve(np.asarray(values, dtype=np.float32), np.ones(window_size) / window_size, mode="valid")
+
+
+def save_learning_plots(plot_dir, episode_returns, q_losses, actor_losses):
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    if episode_returns:
+        steps, returns = zip(*episode_returns)
+        returns = np.asarray(returns, dtype=np.float32)
+        ma_returns = _moving_average(returns, min(10, len(returns)))
+        ma_steps = np.asarray(steps, dtype=np.int32)[len(steps) - len(ma_returns) :]
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, returns, alpha=0.3, linewidth=1.0, label="episodic return")
+        ax.plot(ma_steps, ma_returns, linewidth=2.0, label="moving average")
+        ax.set_title("Episode Return")
+        ax.set_xlabel("Global step")
+        ax.set_ylabel("Return")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "episode_return.png", dpi=150)
+        plt.close(fig)
+
+    if q_losses or actor_losses:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        if q_losses:
+            q_steps, q_values = zip(*q_losses)
+            ax.plot(q_steps, q_values, alpha=0.4, linewidth=1.0, label="q loss")
+        if actor_losses:
+            actor_steps, actor_values = zip(*actor_losses)
+            ax.plot(actor_steps, actor_values, alpha=0.4, linewidth=1.0, label="actor loss")
+        ax.set_title("Training Losses")
+        ax.set_xlabel("Global step")
+        ax.set_ylabel("Loss")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "training_losses.png", dpi=150)
+        plt.close(fig)
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -137,6 +184,9 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     start_time = time.time()
+    episode_returns = []
+    q_losses = []
+    actor_losses = []
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -154,16 +204,22 @@ if __name__ == "__main__":
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                break
+        final_infos = infos.get("final_info")
+        if final_infos is not None:
+            for info in final_infos:
+                if info is not None and "episode" in info:
+                    episodic_return = float(info["episode"]["r"])
+                    episode_returns.append((global_step, episodic_return))
+                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+        final_observations = infos.get("final_observation")
+        if final_observations is not None:
+            for idx, trunc in enumerate(truncations):
+                if trunc and final_observations[idx] is not None:
+                    real_next_obs[idx] = final_observations[idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -179,6 +235,7 @@ if __name__ == "__main__":
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            q_losses.append((global_step, float(qf1_loss.item())))
 
             # optimize the model
             q_optimizer.zero_grad()
@@ -187,6 +244,7 @@ if __name__ == "__main__":
 
             if global_step % args.policy_frequency == 0:
                 actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                actor_losses.append((global_step, float(actor_loss.item())))
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
@@ -201,3 +259,4 @@ if __name__ == "__main__":
                 print("SPS:", int(global_step / (time.time() - start_time)))
 
     envs.close()
+    save_learning_plots(args.plot_dir, episode_returns, q_losses, actor_losses)
